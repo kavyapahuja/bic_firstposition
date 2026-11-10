@@ -10,6 +10,23 @@
 static float window[WINDOW_SIZE][FD_NUM_AXES];
 static int samplesInWindow = 0;
 static unsigned long lastSampleTime = 0;
+static int samplesSinceRawPrint = 0;
+
+static void printRawReading(const SensorSample &sample) {
+  Serial.print("RAW | ax=");
+  Serial.print(sample.values[0], 3);
+  Serial.print(" ay=");
+  Serial.print(sample.values[1], 3);
+  Serial.print(" az=");
+  Serial.print(sample.values[2], 3);
+  Serial.print(" g | gx=");
+  Serial.print(sample.values[3], 2);
+  Serial.print(" gy=");
+  Serial.print(sample.values[4], 2);
+  Serial.print(" gz=");
+  Serial.print(sample.values[5], 2);
+  Serial.println(" degrees/second");
+}
 
 static void checkWindowForFall() {
   float features[FD_NUM_FEATURES];
@@ -20,16 +37,13 @@ static void checkWindowForFall() {
   const float peakAccelerationG =
       fd_peak_acc_g(&window[0][0], WINDOW_SIZE);
 
-  const bool fallDetected =
-      sensorFallDetected(predictedClass, peakAccelerationG);
-
   Serial.print("Activity: ");
   Serial.print(FD_CLASS_NAMES[predictedClass]);
   Serial.print(" | Peak acceleration: ");
-  Serial.print(peakAccelerationG);
+  Serial.print(peakAccelerationG, 2);
   Serial.println(" g");
 
-  if (fallDetected) {
+  if (sensorFallDetected(predictedClass, peakAccelerationG)) {
     Serial.println("SENSOR FALL DETECTED");
   }
 }
@@ -41,22 +55,24 @@ static void moveWindowForward() {
       (WINDOW_SIZE - WINDOW_STEP_SIZE) * FD_NUM_AXES * sizeof(float)
   );
 
-  // Keep the newest half of the previous window.
   samplesInWindow = WINDOW_SIZE - WINDOW_STEP_SIZE;
 }
 
 void setup() {
   Serial.begin(115200);
-  delay(200);
+  delay(500);
+
+  Serial.println();
+  Serial.println("DWINETRA sensor check starting");
 
   if (!sensorBegin()) {
-    Serial.println("Sensor setup failed. Check the wiring and pin values.");
+    Serial.println("Sensor setup failed. Check the I2C pins and wiring.");
     while (true) {
       delay(1000);
     }
   }
 
-  Serial.println("DWINETRA sensor detection started");
+  Serial.println("Sensor ready. Leave it still for the first readings.");
 }
 
 void loop() {
@@ -71,8 +87,15 @@ void loop() {
   SensorSample sample;
 
   if (!sensorRead(sample)) {
-    Serial.println("Could not read the sensor");
+    Serial.println("Could not read the MPU6050");
     return;
+  }
+
+  // Print every 10th sample: about 10 lines per second at a 100 Hz sample rate.
+  samplesSinceRawPrint++;
+  if (samplesSinceRawPrint >= SAMPLE_RATE_HZ / 10) {
+    samplesSinceRawPrint = 0;
+    printRawReading(sample);
   }
 
   memcpy(window[samplesInWindow], sample.values, sizeof(sample.values));
