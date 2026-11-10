@@ -10,7 +10,6 @@ constexpr unsigned long SAMPLE_PERIOD_MS = 1000UL / SAMPLE_RATE_HZ;
 
 // Convert MPU6050 readings to the units expected by the model.
 constexpr float GRAVITY_MS2 = 9.80665f;
-constexpr float RAD_TO_DEG = 57.29578f;
 
 // Keep the reference impact threshold for now.
 // TODO: Review after testing with the actual sensor.
@@ -20,6 +19,6 @@ constexpr float FALL_IMPACT_THRESHOLD_G = 1.7f;
 constexpr unsigned long ALERT_COOLDOWN_MS = 15000UL;
 
 // TODO: Fill these in after confirming the ESP32 pins and wiring.
-constexpr int I2C_SDA_PIN = -1;
-constexpr int I2C_SCL_PIN = -1;
+constexpr int I2C_SDA_PIN = 22;
+constexpr int I2C_SCL_PIN = 23;
 constexpr int BUZZER_PIN = -1;
