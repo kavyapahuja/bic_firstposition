@@ -14,12 +14,45 @@ static unsigned long lastSampleTime = 0;
 static unsigned long lastFallMessageTime = 0;
 static int samplesSinceReadingMessage = 0;
 
+static float classDecisionScore(const float *rawFeatures, int classIndex) {
+  float score = FD_INTERCEPT[classIndex];
+
+  for (int i = 0; i < FD_NUM_FEATURES; i++) {
+    const float scaled =
+        (rawFeatures[i] - FD_SCALER_MEAN[i]) / FD_SCALER_SCALE[i];
+    score += scaled * FD_COEF[classIndex][i];
+  }
+
+  return score;
+}
+
 static void checkWindowForFall() {
   float features[FD_NUM_FEATURES];
 
   fd_extract_features(&window[0][0], WINDOW_SIZE, features);
 
-  const int predictedClass = fd_predict(features, nullptr);
+  float winningScore = 0.0f;
+  const int predictedClass = fd_predict(features, &winningScore);
+
+  const float fallScore = classDecisionScore(features, FD_FALL_CLASS);
+
+  float highestOtherScore = 0.0f;
+  bool foundOtherClass = false;
+
+  for (int classIndex = 0; classIndex < FD_NUM_CLASSES; classIndex++) {
+    if (classIndex == FD_FALL_CLASS) {
+      continue;
+    }
+
+    const float score = classDecisionScore(features, classIndex);
+    if (!foundOtherClass || score > highestOtherScore) {
+      highestOtherScore = score;
+      foundOtherClass = true;
+    }
+  }
+
+  const float fallMargin = fallScore - highestOtherScore;
+
   const float peakAccelerationG =
       fd_peak_acc_g(&window[0][0], WINDOW_SIZE);
 
@@ -30,6 +63,13 @@ static void checkWindowForFall() {
   Serial.print(" | Peak acceleration: ");
   Serial.print(peakAccelerationG, 2);
   Serial.println(" g");
+
+  Serial.print("Winning score: ");
+  Serial.print(winningScore, 3);
+  Serial.print(" | Fall score: ");
+  Serial.print(fallScore, 3);
+  Serial.print(" | Fall margin: ");
+  Serial.println(fallMargin, 3);
 
   wifiSendActivity(activity, peakAccelerationG);
 
@@ -91,7 +131,7 @@ void loop() {
 
   // Send one raw sample for every ten sensor samples: about 10 messages/second.
   samplesSinceReadingMessage++;
-  if (samplesSinceReadingMessage >= SAMPLE_RATE_HZ / 10) {
+  if (samplesSinceReadingMessage >= SAMPLE_RATE_HZ) {
     samplesSinceReadingMessage = 0;
     wifiSendReading(sample);
   }

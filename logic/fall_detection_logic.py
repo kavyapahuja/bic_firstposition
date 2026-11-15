@@ -93,11 +93,11 @@ def main():
                         flush=True,
                     )
 
-                elif message_type == "fall":
+                 elif message_type == "fall":
                     print(
-                        "SENSOR FALL DETECTED | "
-                        f"Camera posture flag: {camera_flag} | "
-                        f"FINAL RESULT: FALL | "
+                        "SENSOR FALL CANDIDATE | "
+                        f"Camera posture flag (info only): {camera_flag} | "
+                        "FINAL RESULT: NOT YET CONFIRMED | "
                         f"Peak acceleration: {message.get('peak_g')} g",
                         flush=True,
                     )
