@@ -21,15 +21,27 @@ bool canSend() {
 
 void sendPacket(const String &message) {
   if (!canSend()) {
+    Serial.println("[wifi] Cannot send: Wi-Fi disconnected or invalid IP");
     return;
   }
 
   if (!udp.beginPacket(laptopAddress, WIFI_STATUS_PORT)) {
+    Serial.println("[wifi] beginPacket FAILED");
     return;
   }
 
   udp.print(message);
-  udp.endPacket();
+
+  if (udp.endPacket() == 1) {
+    static bool firstSuccess = true;
+
+    if (firstSuccess) {
+      Serial.println("[wifi] UDP packet sent successfully");
+      firstSuccess = false;
+    }
+  } else {
+    Serial.println("[wifi] UDP packet FAILED");
+  }
 }
 }
 
