@@ -1,20 +1,229 @@
-import json
-import socket
-from pathlib import Path
-import sys
+"""
+DWINETRA combined test: ESP32 band + camera.
 
-import cv2
+How it works
+  * The band is the PRIMARY detector. When it reports a fall, an alert is sent
+    immediately. The camera never blocks or cancels it.
+  * The camera is extra information. The alert says what the camera sees at
+    that moment, and a short follow-up says whether the camera confirmed the
+    fall within the next few seconds.
+
+Telegram alerts (optional): set these environment variables before running
+    TELEGRAM_BOT_TOKEN   (from @BotFather)
+    TELEGRAM_CHAT_ID     (your chat id)
+Without them the alert is still printed and a snapshot is saved to ./alerts
+"""
+
+import json
+import os
+import socket
+import sys
+import threading
+import time
+import urllib.parse
+import urllib.request
+from pathlib import Path
 
 CAMERA_DIR = Path(__file__).resolve().parent.parent / "camera"
 sys.path.insert(0, str(CAMERA_DIR))
 
-from main import VisionFallDetector
-
-
-LISTEN_PORT = 5005
+LISTEN_PORT = 5005  # must match WIFI_STATUS_PORT in the ESP32 secrets.h
 MODEL_PATH = CAMERA_DIR / "pose_landmarker.task"
+ALERT_DIR = Path(__file__).resolve().parent / "alerts"
+
+# ---------------------------------------------------------------------------
+# Settings
+# ---------------------------------------------------------------------------
+
+# After an alert, keep watching the camera this long and report whether it
+# confirmed the fall.
+CAMERA_FOLLOW_UP_S = 10.0
+
+# Ignore further band fall messages for this long after an alert.
+ALERT_COOLDOWN_S = 15.0
+
+# Warn if the band sends nothing for this long (battery dead, Wi-Fi lost).
+BAND_OFFLINE_S = 15.0
+
+# Show "FALL ALERT SENT" on the video for this long.
+ALERT_BANNER_S = 8.0
+
+# Print a line for every raw reading / activity message from the band.
+PRINT_READINGS = True
+
+
+# ---------------------------------------------------------------------------
+# Alerts
+# ---------------------------------------------------------------------------
+
+def send_telegram(text):
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+
+    if not token or not chat_id:
+        print("[alert] Telegram is not set up (see the top of this file).")
+        return
+
+    def worker():
+        try:
+            data = urllib.parse.urlencode(
+                {"chat_id": chat_id, "text": text}
+            ).encode("utf-8")
+            request = urllib.request.Request(
+                f"https://api.telegram.org/bot{token}/sendMessage", data=data
+            )
+            urllib.request.urlopen(request, timeout=10).read()
+            print("[alert] Telegram message sent.", flush=True)
+        except Exception as error:  # network problems must not crash the app
+            print(f"[alert] Telegram failed: {error}", flush=True)
+
+    # Run in the background so the video does not freeze.
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def describe_camera(camera_flag, body_angle):
+    """Plain-English description of what the camera sees right now."""
+    if camera_flag:
+        return "camera ALSO sees a fallen posture"
+    if body_angle is None:
+        return "camera cannot see the person"
+    return f"camera sees no fall posture (torso angle {body_angle:.0f} deg)"
+
+
+def raise_alert(event, frame):
+    import cv2
+
+    text = (
+        "FALL DETECTED by band | "
+        f"sensor peak {event['peak_g']} g | "
+        f"{event['camera_at_alert']} | "
+        f"{time.strftime('%d %b %Y %H:%M:%S')}"
+    )
+
+    print("=" * 70, flush=True)
+    print(f"ALERT: {text}", flush=True)
+    print("=" * 70, flush=True)
+
+    try:
+        ALERT_DIR.mkdir(exist_ok=True)
+        snapshot = ALERT_DIR / f"fall_{time.strftime('%Y%m%d_%H%M%S')}.jpg"
+        cv2.imwrite(str(snapshot), frame)
+        print(f"[alert] Snapshot saved: {snapshot}", flush=True)
+    except Exception as error:
+        print(f"[alert] Could not save snapshot: {error}", flush=True)
+
+    send_telegram(text)
+
+
+# ---------------------------------------------------------------------------
+# Band fall events + camera follow-up
+# ---------------------------------------------------------------------------
+
+class FallTracker:
+    """Handles band fall messages and the camera follow-up."""
+
+    def __init__(self):
+        self.seen_ids = {}
+        self.last_alert_time = None
+        self.follow_up = None
+
+    def on_sensor_fall(self, message, now, camera_flag, body_angle):
+        """Return an event dict if an alert should be raised, else None.
+
+        The band sends every fall message 3 times, so repeats are ignored.
+        """
+        self.seen_ids = {
+            event_id: seen_at
+            for event_id, seen_at in self.seen_ids.items()
+            if now - seen_at < 60.0
+        }
+
+        event_id = message.get("id")
+        if event_id is not None:
+            if event_id in self.seen_ids:
+                return None
+            self.seen_ids[event_id] = now
+
+        if (
+            self.last_alert_time is not None
+            and now - self.last_alert_time < ALERT_COOLDOWN_S
+        ):
+            print("Band fall message ignored (cooldown).", flush=True)
+            return None
+
+        self.last_alert_time = now
+
+        event = {
+            "id": event_id,
+            "peak_g": message.get("peak_g"),
+            "start": now,
+            "person_seen": body_angle is not None,
+            "camera_at_alert": describe_camera(camera_flag, body_angle),
+        }
+
+        # If the camera already agrees there is nothing left to wait for.
+        self.follow_up = None if camera_flag else event
+        return event
+
+    def update(self, now, camera_flag, body_angle):
+        """Call once per camera frame while a follow-up is pending.
+
+        Returns None, or (result, event) where result is
+        'confirmed', 'not_confirmed_seen' or 'not_confirmed_not_visible'.
+        """
+        event = self.follow_up
+        if event is None:
+            return None
+
+        if body_angle is not None:
+            event["person_seen"] = True
+
+        if camera_flag:
+            self.follow_up = None
+            return "confirmed", event
+
+        if now - event["start"] >= CAMERA_FOLLOW_UP_S:
+            self.follow_up = None
+            if event["person_seen"]:
+                return "not_confirmed_seen", event
+            return "not_confirmed_not_visible", event
+
+        return None
+
+    def follow_up_text(self, now):
+        if self.follow_up is None:
+            return None
+        remaining = max(0.0, CAMERA_FOLLOW_UP_S - (now - self.follow_up["start"]))
+        return f"Alert sent - waiting for camera to confirm ({remaining:.0f}s)"
+
+    def banner_active(self, now):
+        return (
+            self.last_alert_time is not None
+            and now - self.last_alert_time < ALERT_BANNER_S
+        )
+
+
+FOLLOW_UP_MESSAGES = {
+    "confirmed": "Camera now CONFIRMS the fall.",
+    "not_confirmed_seen": (
+        "Camera did NOT see a fall posture. The band alert may be a false "
+        "alarm - please check."
+    ),
+    "not_confirmed_not_visible": (
+        "Camera never saw the person, so it could not confirm. "
+        "The band alert still stands - please check."
+    ),
+}
+
+
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
 
 def main():
+    import cv2
+    from main import VisionFallDetector  # camera/main.py
+
     if not MODEL_PATH.is_file():
         print(f"Pose model not found: {MODEL_PATH}")
         return
@@ -35,7 +244,10 @@ def main():
     print(f"Listening for ESP32 messages on UDP port {LISTEN_PORT}.")
     print("Camera is running. Press q in the camera window to quit.")
 
+    tracker = FallTracker()
     last_camera_flag = None
+    last_band_message_time = None
+    band_offline_reported = False
 
     try:
         while True:
@@ -44,6 +256,7 @@ def main():
                 print("Could not read a camera frame.")
                 break
 
+            now = time.monotonic()
             frame, camera_flag, body_angle = detector.process_frame(frame)
 
             # Print the camera status only when it changes.
@@ -72,9 +285,14 @@ def main():
                     print("Received an unreadable ESP32 message.")
                     continue
 
+                last_band_message_time = now
+                if band_offline_reported:
+                    print("Band is back online.", flush=True)
+                    band_offline_reported = False
+
                 message_type = message.get("type")
 
-                if message_type == "reading":
+                if message_type == "reading" and PRINT_READINGS:
                     print(
                         "READING | "
                         f"ax={message.get('ax_g')} "
@@ -86,21 +304,60 @@ def main():
                         flush=True,
                     )
 
-                elif message_type == "activity":
+                elif message_type == "activity" and PRINT_READINGS:
                     print(
                         f"Activity: {message.get('class')} | "
                         f"Peak acceleration: {message.get('peak_g')} g",
                         flush=True,
                     )
 
-                 elif message_type == "fall":
-                    print(
-                        "SENSOR FALL CANDIDATE | "
-                        f"Camera posture flag (info only): {camera_flag} | "
-                        "FINAL RESULT: NOT YET CONFIRMED | "
-                        f"Peak acceleration: {message.get('peak_g')} g",
-                        flush=True,
+                elif message_type == "fall":
+                    event = tracker.on_sensor_fall(
+                        message, now, camera_flag, body_angle
                     )
+                    if event is not None:
+                        raise_alert(event, frame)
+
+            # Camera follow-up after an alert.
+            finished = tracker.update(now, camera_flag, body_angle)
+            if finished is not None:
+                result, event = finished
+                follow_up = FOLLOW_UP_MESSAGES[result]
+                print(f"FOLLOW-UP | {follow_up}", flush=True)
+                send_telegram(f"Follow-up: {follow_up}")
+
+            # Band offline warning.
+            if (
+                last_band_message_time is not None
+                and not band_offline_reported
+                and now - last_band_message_time > BAND_OFFLINE_S
+            ):
+                print(
+                    f"WARNING: no message from the band for {BAND_OFFLINE_S:.0f} s "
+                    "(battery, Wi-Fi or power problem).",
+                    flush=True,
+                )
+                band_offline_reported = True
+
+            # Status text on the video.
+            if last_band_message_time is None:
+                band_text = "Band: waiting for first message"
+            elif band_offline_reported:
+                band_text = "Band: OFFLINE"
+            else:
+                band_text = "Band: online"
+
+            cv2.putText(frame, band_text, (30, 120),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+            if tracker.banner_active(now):
+                cv2.putText(frame, "FALL ALERT SENT", (30, 160),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
+
+            follow_up_text = tracker.follow_up_text(now)
+            if follow_up_text:
+                cv2.putText(frame, follow_up_text, (30, 195),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
 
             cv2.imshow("DWINETRA Combined Test", frame)
 

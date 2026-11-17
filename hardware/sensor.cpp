@@ -1,4 +1,3 @@
-
 #include <Arduino.h>
 #include <Wire.h>
 
@@ -10,6 +9,7 @@ namespace {
 constexpr uint8_t MPU_ADDR = 0x68;
 
 bool sensorReady = false;
+bool wireStarted = false;
 uint8_t chipID = 0;
 
 // Write a value to a sensor register
@@ -47,11 +47,11 @@ int16_t readInt16(uint8_t highByte, uint8_t lowByte) {
   return (int16_t)(((uint16_t)highByte << 8) | lowByte);
 }
 
-} // namespace
+}  // namespace
 
 
+// Can be called again later to recover from a sensor problem.
 bool sensorBegin() {
-
   sensorReady = false;
 
   if (I2C_SDA_PIN < 0 || I2C_SCL_PIN < 0) {
@@ -59,9 +59,12 @@ bool sensorBegin() {
     return false;
   }
 
-  // Start I2C using pins from config.h
-  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
-  Wire.setClock(100000);
+  // Start I2C once, using the pins from config.h
+  if (!wireStarted) {
+    Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+    Wire.setClock(100000);
+    wireStarted = true;
+  }
 
   delay(100);
 
@@ -78,11 +81,9 @@ bool sensorBegin() {
 
   if (chipID == 0x68) {
     Serial.println("MPU6050 detected");
-  }
-  else if (chipID == 0x70) {
+  } else if (chipID == 0x70) {
     Serial.println("MPU6500 detected");
-  }
-  else {
+  } else {
     Serial.println("Unsupported MPU chip");
     return false;
   }
@@ -106,12 +107,13 @@ bool sensorBegin() {
     return false;
   }
 
-  // Gyroscope filter configuration
+  // Digital low-pass filter (about 184 Hz). On the MPU6050 this one register
+  // filters both the accelerometer and the gyroscope.
   if (!writeRegister(0x1A, 0x01)) {
     return false;
   }
 
-  // Internal sample rate: 100 Hz
+  // Internal sample rate: 1000 Hz / (1 + 9) = 100 Hz
   if (!writeRegister(0x19, 0x09)) {
     return false;
   }
@@ -147,7 +149,6 @@ bool sensorBegin() {
 
 
 bool sensorRead(SensorSample &sample) {
-
   if (!sensorReady) {
     return false;
   }
@@ -171,31 +172,15 @@ bool sensorRead(SensorSample &sample) {
 
   // Convert accelerometer readings to g
   // +/- 8g sensitivity = 4096 LSB/g
-
   sample.values[0] = ax / 4096.0f;
   sample.values[1] = ay / 4096.0f;
   sample.values[2] = az / 4096.0f;
 
   // Convert gyroscope readings to degrees per second
   // +/- 500 dps sensitivity = 65.5 LSB/dps
-
   sample.values[3] = gx / 65.5f;
   sample.values[4] = gy / 65.5f;
   sample.values[5] = gz / 65.5f;
-static unsigned long lastPrint = 0;
 
-if (millis() - lastPrint >= 500) {
-  lastPrint = millis();
-
-  Serial.printf(
-    "AX: %.2f | AY: %.2f | AZ: %.2f | GX: %.2f | GY: %.2f | GZ: %.2f\n",
-    sample.values[0],
-    sample.values[1],
-    sample.values[2],
-    sample.values[3],
-    sample.values[4],
-    sample.values[5]
-  );
-}
   return true;
 }

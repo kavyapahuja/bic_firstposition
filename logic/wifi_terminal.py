@@ -1,8 +1,10 @@
 import json
 import socket
 
-# TODO: Keep this port the same in the ESP32 Wi-Fi sender.
+# Keep this port the same as WIFI_STATUS_PORT in the ESP32 secrets.h.
 LISTEN_PORT = 5005
+
+seen_fall_ids = set()
 
 with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as receiver:
     receiver.bind(("0.0.0.0", LISTEN_PORT))
@@ -17,7 +19,9 @@ with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as receiver:
             print("Received a message that could not be read.")
             continue
 
-        if message.get("type") == "reading":
+        message_type = message.get("type")
+
+        if message_type == "reading":
             print(
                 "READING | "
                 f"ax={message.get('ax_g')} ay={message.get('ay_g')} "
@@ -28,14 +32,22 @@ with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as receiver:
                 flush=True,
             )
 
-        elif message.get("type") == "fall":
+        elif message_type == "fall":
+            # The band sends each fall 3 times; show it once.
+            event_id = message.get("id")
+            if event_id is not None:
+                if event_id in seen_fall_ids:
+                    continue
+                seen_fall_ids.add(event_id)
+
             print(
-                "FALL DETECTED | "
+                "SENSOR FALL DETECTED | "
+                f"id={event_id} | "
                 f"peak acceleration={message.get('peak_g')} g",
                 flush=True,
             )
 
-        elif message.get("type") == "activity":
+        elif message_type == "activity":
             print(
                 f"Activity: {message.get('class')} | "
                 f"Peak acceleration: {message.get('peak_g')} g",
