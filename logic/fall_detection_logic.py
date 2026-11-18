@@ -8,21 +8,18 @@ How it works
     that moment, and a short follow-up says whether the camera confirmed the
     fall within the next few seconds.
 
-Telegram alerts (optional): set these environment variables before running
-    TELEGRAM_BOT_TOKEN   (from @BotFather)
-    TELEGRAM_CHAT_ID     (your chat id)
-Without them the alert is still printed and a snapshot is saved to ./alerts
+Phone alerts go through Telegram (see the setup steps at the top of
+telegram_alert.py). Without it the alert is still printed and a snapshot is
+saved to ./alerts
 """
 
 import json
-import os
 import socket
 import sys
-import threading
 import time
-import urllib.parse
-import urllib.request
 from pathlib import Path
+
+import telegram_alert
 
 CAMERA_DIR = Path(__file__).resolve().parent.parent / "camera"
 sys.path.insert(0, str(CAMERA_DIR))
@@ -56,31 +53,6 @@ PRINT_READINGS = True
 # Alerts
 # ---------------------------------------------------------------------------
 
-def send_telegram(text):
-    token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-
-    if not token or not chat_id:
-        print("[alert] Telegram is not set up (see the top of this file).")
-        return
-
-    def worker():
-        try:
-            data = urllib.parse.urlencode(
-                {"chat_id": chat_id, "text": text}
-            ).encode("utf-8")
-            request = urllib.request.Request(
-                f"https://api.telegram.org/bot{token}/sendMessage", data=data
-            )
-            urllib.request.urlopen(request, timeout=10).read()
-            print("[alert] Telegram message sent.", flush=True)
-        except Exception as error:  # network problems must not crash the app
-            print(f"[alert] Telegram failed: {error}", flush=True)
-
-    # Run in the background so the video does not freeze.
-    threading.Thread(target=worker, daemon=True).start()
-
-
 def describe_camera(camera_flag, body_angle):
     """Plain-English description of what the camera sees right now."""
     if camera_flag:
@@ -104,15 +76,20 @@ def raise_alert(event, frame):
     print(f"ALERT: {text}", flush=True)
     print("=" * 70, flush=True)
 
+    snapshot = None
     try:
         ALERT_DIR.mkdir(exist_ok=True)
         snapshot = ALERT_DIR / f"fall_{time.strftime('%Y%m%d_%H%M%S')}.jpg"
-        cv2.imwrite(str(snapshot), frame)
-        print(f"[alert] Snapshot saved: {snapshot}", flush=True)
+        if cv2.imwrite(str(snapshot), frame):
+            print(f"[alert] Snapshot saved: {snapshot}", flush=True)
+        else:
+            snapshot = None
     except Exception as error:
+        snapshot = None
         print(f"[alert] Could not save snapshot: {error}", flush=True)
 
-    send_telegram(text)
+    # Sent in the background, in order: photo + text first, follow-up later.
+    telegram_alert.send_alert(text, str(snapshot) if snapshot else None)
 
 
 # ---------------------------------------------------------------------------
@@ -288,6 +265,7 @@ def main():
                 last_band_message_time = now
                 if band_offline_reported:
                     print("Band is back online.", flush=True)
+                    telegram_alert.send_text("Band is back online.")
                     band_offline_reported = False
 
                 message_type = message.get("type")
@@ -324,7 +302,7 @@ def main():
                 result, event = finished
                 follow_up = FOLLOW_UP_MESSAGES[result]
                 print(f"FOLLOW-UP | {follow_up}", flush=True)
-                send_telegram(f"Follow-up: {follow_up}")
+                telegram_alert.send_text(f"Follow-up: {follow_up}")
 
             # Band offline warning.
             if (
@@ -336,6 +314,10 @@ def main():
                     f"WARNING: no message from the band for {BAND_OFFLINE_S:.0f} s "
                     "(battery, Wi-Fi or power problem).",
                     flush=True,
+                )
+                telegram_alert.send_text(
+                    f"WARNING: no message from the band for {BAND_OFFLINE_S:.0f} s "
+                    "(battery, Wi-Fi or power problem)."
                 )
                 band_offline_reported = True
 
@@ -365,6 +347,7 @@ def main():
                 break
 
     finally:
+        telegram_alert.wait_until_sent()
         receiver.close()
         camera.release()
         detector.close()

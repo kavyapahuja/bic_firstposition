@@ -1,2 +1,3 @@
 # DWINETRA Wi-Fi credentials
 /hardware/secrets.h
+logic/telegram_secrets.py
